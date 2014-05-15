@@ -1,0 +1,196 @@
+
+JdbcTemplate中有两个可能会混淆的queryForObject方法：
+1.
+Object	queryForObject(String sql, Object[] args, Class requiredType) 
+2.
+Object	queryForObject(String sql, Object[] args, RowMapper rowMapper) 
+
+第1个方法是只查一列的，参数“requiredType”不可以是自定义的类
+如果要把查询结果封装为自定义的类，需要采用第2个方法
+
+例如：
+[code="java"]
+	//只查询一列：name
+	String sql = "SELECT NAME FROM CUSTOMER WHERE CUST_ID = ?";
+ 
+	String name = (String)getJdbcTemplate().queryForObject(
+			sql, new Object[] { custId }, String.class);
+ 
+	return name;
+	
+	//查询返回自定义的类
+	String sql = "SELECT * FROM CUSTOMER WHERE CUST_ID = ?";
+ 
+	Customer customer = (Customer)getJdbcTemplate().queryForObject(
+			sql, new Object[] { custId }, 
+			new BeanPropertyRowMapper(Customer.class));
+ 
+	return customer;
+[/code]
+
+分析一下第2个方法的源码
+
+先看看BeanPropertyRowMapper
+其实不用看源码都知道思路了：
+new BeanPropertyRowMapper(Customer.class)
+mapRow(ResultSet rs, int rowNumber)
+遍历ResultSet，每一行对应一个Customer对象
+遍历每一行时，顺序遍历各列，取得该列的值通过反射调用对应的setter方法，赋值给到Customer对象
+注意到无论是取列名还是取列的值，都是通过index（1~columnCount）来取的
+
+[code="java"]
+public T mapRow(ResultSet rs, int rowNumber) throws SQLException {
+		T mappedObject = BeanUtils.instantiate(this.mappedClass);
+		BeanWrapper bw = PropertyAccessorFactory.forBeanPropertyAccess(mappedObject);
+
+		ResultSetMetaData rsmd = rs.getMetaData();
+		int columnCount = rsmd.getColumnCount();
+		Set<String> populatedProperties = (isCheckFullyPopulated() ? new HashSet<String>() : null);
+
+		for (int index = 1; index <= columnCount; index++) {
+			String column = JdbcUtils.lookupColumnName(rsmd, index);
+			PropertyDescriptor pd = this.mappedFields.get(column.replaceAll(" ", "").toLowerCase());
+			if (pd != null) {
+				try {
+					Object value = getColumnValue(rs, index, pd);
+				    bw.setPropertyValue(pd.getName(), value);
+					if (populatedProperties != null) {
+						populatedProperties.add(pd.getName());
+					}
+				}
+			}
+		}
+
+		if (populatedProperties != null && !populatedProperties.equals(this.mappedProperties)) {
+			throw new InvalidDataAccessApiUsageException("Given ResultSet does not contain all fields " +
+					"necessary to populate object of class [" + this.mappedClass + "]: " + this.mappedProperties);
+		}
+
+		return mappedObject;
+	}
+[/code]
+注意到mapRow方法里面，populatedProperties变量是用来检查是否所有的property都正确地实现了赋值
+再看看BeanPropertyRowMapper的构造函数：
+[code="java"]
+	public BeanPropertyRowMapper(Class<T> mappedClass) {
+		initialize(mappedClass);
+	}
+	
+	protected void initialize(Class<T> mappedClass) {
+		this.mappedClass = mappedClass;
+		
+		/*保存field
+		注意到对于驼峰式命名的field：
+		例如，对于gameId, mappedFields 会同时保存"gameId"和"game_id"
+		因此在sql语句中，
+		select  id as game_id, name from game和
+		select  id as gameId, name from game的效果是一样的
+		*/
+		this.mappedFields = new HashMap<String, PropertyDescriptor>();
+		
+		//保存property
+		this.mappedProperties = new HashSet<String>();
+		PropertyDescriptor[] pds = BeanUtils.getPropertyDescriptors(mappedClass);
+		for (PropertyDescriptor pd : pds) {
+			if (pd.getWriteMethod() != null) {
+				this.mappedFields.put(pd.getName().toLowerCase(), pd);
+				String underscoredName = underscoreName(pd.getName());
+				if (!pd.getName().toLowerCase().equals(underscoredName)) {
+					this.mappedFields.put(underscoredName, pd);
+				}
+				this.mappedProperties.add(pd.getName());
+			}
+		}
+	}
+	
+	//1. "game", return "game", unchanged
+	//2. "gameId", return "game_id"
+	private String underscoreName(String name) {
+		//......
+	}
+	
+[/code]
+
+看完了BeanPropertyRowMapper，回到queryForObject
+调用过程：
+queryForObject(String sql, Object[] args, RowMapper<T> rowMapper)
+query(sql, args, new RowMapperResultSetExtractor<T>(rowMapper, 1))
+query(sql, newArgPreparedStatementSetter(args), resultSetExtractor)
+query(new SimplePreparedStatementCreator(sql), argPreparedStatementSetter, resultSetExtractor)
+query(PreparedStatementCreator psc, final PreparedStatementSetter argPreparedStatementSetter, final ResultSetExtractor<T>  resultSetExtractor)
+整个过程跟JdbcTemplate的batchUpdate方法是类似的
+1.
+对于参数'sql'，它最终的作用是生成一个PreparedStatement：
+connection.prepareStatement(sql);
+2.
+对sql语句中“?”的赋值，是通过PreparedStatementSetter
+需要两个数据：
+一是“?”所对应的值，也就是Object[] args
+二是PreparedStatement
+对第一个数据：
+args是在ArgPreparedStatementSetter的构造函数中传入
+对第二个数据：
+在最后的query方法中，把创建好的PreparedStatement作为匿名内部类PreparedStatementCallback.doInPreparedStatement方法的参数
+最后得以传给ArgPreparedStatementSetter：
+[code="java"]
+public <T> T query(
+			PreparedStatementCreator psc, final PreparedStatementSetter argPreparedStatementSetter, final ResultSetExtractor<T> rse) {
+					return execute(psc, 
+										new PreparedStatementCallback<T>() {
+											public T doInPreparedStatement(PreparedStatement ps) {
+												//...
+												argPreparedStatementSetter.setValues(ps);
+												ResultSet rsToUse = ps.executeQuery();
+												return rse.extractData(rsToUse);
+												//...
+											}
+										}
+					);
+}
+[/code]
+
+ArgPreparedStatementSetter的setValues方法：
+[code="java"]
+public void setValues(PreparedStatement ps) throws SQLException {
+		if (this.args != null) {
+			for (int i = 0; i < this.args.length; i++) {
+				Object arg = this.args[i];
+				
+				/*
+					doSetValue方法会根据arg的实际类型去调用ps.setSpecificType(index, arg)方法，例如：
+					if (isStringValue(arg.getClass())) {
+						ps.setString(paramIndex, arg.toString());
+					}
+				*/
+				doSetValue(ps, i + 1, arg);
+			}
+		}
+	}
+[/code]
+
+最后看一下RowMapperResultSetExtractor
+它有两个字段：
+private final RowMapper<T> rowMapper;
+private final int rowsExpected;
+因为是queryForObject，因此rowsExpected=1
+extractData方法很直观，是在上面的doInPreparedStatement调用的：
+[code="java"]
+	public List<T> extractData(ResultSet rs) throws SQLException {
+		List<T> results = (this.rowsExpected > 0 ? new ArrayList<T>(this.rowsExpected) : new ArrayList<T>());
+		int rowNum = 0;
+		
+		//rs.next()迭代每一行
+		while (rs.next()) {
+			results.add(this.rowMapper.mapRow(rs, rowNum++));
+		}
+		return results;
+	}
+[/code]
+
+
+
+
+
+
+
+

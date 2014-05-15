@@ -1,0 +1,92 @@
+
+
+JDBC的事务很简单：
+
+		Connection dbConnection = null;
+		PreparedStatement preparedStatementInsert = null;
+		String insertTableSQL = ...;
+ 
+		try {
+		
+			dbConnection = getDBConnection();
+			
+			//注意transaction是与一个connection（而不是dataSource）关联的
+			dbConnection.setAutoCommit(false);
+ 
+			preparedStatementInsert = dbConnection.prepareStatement(insertTableSQL);
+			preparedStatementInsert.setInt(1, 999);
+			preparedStatementInsert.setString(3, "system");
+			preparedStatementInsert.executeUpdate();
+ 
+			//提交
+			dbConnection.commit();
+ 
+		} catch (Exception e) {
+			
+			//回滚
+			dbConnection.rollback();
+			
+		} finally {
+			//release resource
+		}
+		
+如果每一处需要使用事务的地方都这样实现，那重复的代码就太多了
+Spring的AOP可以用来解决这个问题
+大体思路就是生成一个代理类（与DAO或者Service的真实类有相同的接口定义），在调用真实类的方法的前后，
+用事务把它“包”起来
+
+Spring的声明式事务主要包含以下几方面的配置：
+1、DataSource
+2、TransactionManager
+3、代理机制
+
+JDBC、Hibernate、JPA对应不同的TransactionManager和DataSource：
+
+JDBC：
+DataSource & DataSourceTransactionManager
+
+Hibernate：
+SessionFactory & HibernateTransactionManager
+
+JPA：
+EntityManager & JpaTransactionManager
+
+下面看看Spring JDBC的事务的一种配置方式：
+
+<bean id="transactionManager" 
+	class="org.springframework.jdbc.datasource.DataSourceTransactionManager" p:dataSource-ref="dataSource" />
+
+<bean id="transactionInterceptor"
+    class="org.springframework.transaction.interceptor.TransactionInterceptor" p:transactionManager-ref="transactionManager">
+        <property name="transactionAttributes">
+            <props>
+                <prop key="insert*">PROPAGATION_REQUIRED</prop>
+                <prop key="add*">PROPAGATION_REQUIRED</prop>
+                <prop key="do*">PROPAGATION_REQUIRED</prop>
+                <prop key="edit*">PROPAGATION_REQUIRED</prop>
+                <prop key="exec*">PROPAGATION_REQUIRED</prop>
+                <prop key="reset*">PROPAGATION_REQUIRED</prop>
+                <prop key="update*">PROPAGATION_REQUIRED</prop>
+                <prop key="remove*">PROPAGATION_REQUIRED</prop>
+                <prop key="delete*">PROPAGATION_REQUIRED</prop>
+                <prop key="exchange*">PROPAGATION_REQUIRED</prop>
+                <prop key="*">PROPAGATION_REQUIRED,readOnly</prop>
+            </props>
+        </property>
+        <property name="transactionManager">
+            <ref bean="transactionManager"/>
+        </property>
+    </bean>
+
+<!--使用拦截器。事务的边界定义在Service层而不是DAO层，因为有可能一个事务要调用DAO的多个方法-->
+   <bean class="org.springframework.aop.framework.autoproxy.BeanNameAutoProxyCreator">
+        <property name="beanNames">
+            <value>*ServiceImpl</value>
+        </property>
+        <property name="interceptorNames">
+            <list>
+                <value>transactionInterceptor</value>
+            </list>
+        </property>
+    </bean>
+

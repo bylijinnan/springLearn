@@ -1,0 +1,333 @@
+
+以FileSystemXmlApplicationContext为例，把Spring IoC容器的初始化流程走一遍：
+[code="java"]
+ApplicationContext context = new FileSystemXmlApplicationContext
+            ("C:/Users/ZARA/workspace/HelloSpring/src/Beans.xml");
+
+<beans>
+	<import resource="classpath:config/spring/that-other-xml-conf.xml"/>
+	<alias name="trianglePoint" alias="triangle-alias"/>
+	<bean id="yourCoolBean" class="org.jdong.MyCoolBean">
+		<property name="age">100</property>
+	</bean>
+</beans>
+[/code]
+整个流程可用一句话简单概括：
+读入并解析XML文件，把文件中Bean的定义保存在Map里
+
+相应的要做以下几件事：
+1.定位Resource
+2.读入Resource，解析并创建BeanDefinition
+3.把BeanDefinition注册到Map里
+
+第1步由DefaultResourceLoader实现（FileSystemXmlApplicationContext是DefaultResourceLoader的子类）
+第2步交给了BeanDefinitionReader，而BeanDefinitionReader又委托给BeanDefinitionParserDelegate
+注意这一步创建的不是Bean的实例，Bean的实例化是在整个配置文件解析完毕之后再进行
+第3步比较简单，交给BeanDefinitionReaderUtils
+			
+
+首先要明确，FileSystemXmlApplicationContext是实现了ResourceLoader、ResourcePatternResolver接口，继承了DefaultResourceLoader：
+利用org.apache.commons.lang.ClassUtils可以查看FileSystemXmlApplicationContext都实现了哪些接口，都继承了哪些类
+[code="java"]
+allInterfaces:
+interface org.springframework.beans.factory.BeanNameAware
+interface org.springframework.beans.factory.InitializingBean
+interface org.springframework.context.ConfigurableApplicationContext
+interface org.springframework.context.ApplicationContext
+interface org.springframework.beans.factory.ListableBeanFactory
+interface org.springframework.beans.factory.BeanFactory
+interface org.springframework.beans.factory.HierarchicalBeanFactory
+interface org.springframework.context.MessageSource
+interface org.springframework.context.ApplicationEventPublisher
+interface org.springframework.core.io.support.ResourcePatternResolver
+interface org.springframework.core.io.ResourceLoader
+interface org.springframework.context.Lifecycle
+interface org.springframework.beans.factory.DisposableBean
+allSuperclasses:
+class org.springframework.context.support.AbstractXmlApplicationContext
+class org.springframework.context.support.AbstractRefreshableConfigApplicationContext
+class org.springframework.context.support.AbstractRefreshableApplicationContext
+class org.springframework.context.support.AbstractApplicationContext
+class org.springframework.core.io.DefaultResourceLoader
+class java.lang.Object
+[/code]
+因此查看AbstractXmlApplicationContext就不会迷惑了：
+[code="java"]
+	protected void loadBeanDefinitions(DefaultListableBeanFactory beanFactory) throws BeansException, IOException {
+		XmlBeanDefinitionReader beanDefinitionReader = new XmlBeanDefinitionReader(beanFactory);
+
+		//ResourceLoader是this，因为AbstractXmlApplicationContext实现了ResourceLoader接口
+		beanDefinitionReader.setResourceLoader(this);
+		beanDefinitionReader.setEntityResolver(new ResourceEntityResolver(this));
+
+		initBeanDefinitionReader(beanDefinitionReader);
+		loadBeanDefinitions(beanDefinitionReader);
+	}
+[/code]
+	
+由于Spring支持太多的配置方式了，阅读源码时跳来跳去，容易迷失
+因此，最好是根据上面要做的几件事，一个一个的去找
+
+1.资源定位
+DefaultResourceLoader的getResource方法显示，有三种形式的Resource：
+[code="java"]
+	public Resource getResource(String location) {
+		if (location.startsWith(CLASSPATH_URL_PREFIX)) {
+			return new ClassPathResource(location.substring(CLASSPATH_URL_PREFIX.length()), getClassLoader());
+		}
+		else {
+			try {
+				URL url = new URL(location);
+				return new UrlResource(url);
+			}
+			catch (MalformedURLException ex) {
+				return getResourceByPath(location);
+			}
+		}
+	}
+[/code]
+FileSystemXmlApplicationContext是第三种：
+[code="java"]
+	protected Resource getResourceByPath(String path) {
+		if (path != null && path.startsWith("/")) {
+			path = path.substring(1);
+		}
+		return new FileSystemResource(path);
+	}
+[/code]
+DefaultResourceLoader.getResource(string)在哪被调用呢？
+在AbstractBeanDefinitionReader：
+[code="java"]
+public int loadBeanDefinitions(String location, Set actualResources)  {
+		ResourceLoader resourceLoader = getResourceLoader();
+
+		if (resourceLoader instanceof ResourcePatternResolver) {
+			try {
+				Resource[] resources = ((ResourcePatternResolver) resourceLoader).getResources(location);
+				int loadCount = loadBeanDefinitions(resources);
+				return loadCount;
+			}
+		}
+	}
+[/code]
+OK，Resource找到了
+
+2.读取XML并创建BeanDefinition
+XmlBeanDefinitionReader（Spring是用DOM的方式来解析XML的）：
+[code="java"]
+	protected int doLoadBeanDefinitions(InputSource inputSource, Resource resource)
+			throws BeanDefinitionStoreException {
+		try {
+			int validationMode = getValidationModeForResource(resource);
+			Document doc = this.documentLoader.loadDocument(
+					inputSource, getEntityResolver(), this.errorHandler, validationMode, isNamespaceAware());
+			return registerBeanDefinitions(doc, resource);
+		}
+	
+	public int registerBeanDefinitions(Document doc, Resource resource) throws BeanDefinitionStoreException {
+		BeanDefinitionDocumentReader documentReader = createBeanDefinitionDocumentReader();
+		documentReader.registerBeanDefinitions(doc, createReaderContext(resource));
+	}
+[/code]
+顺着上面的方法一直看下去（我们只看XML Namespace为default的那部分）
+到了DefaultBeanDefinitionDocumentReader：
+[code="java"]
+	//遍历XML root里的每个Element（通常是一个Bean定义）
+	NodeList nl = root.getChildNodes();
+	for (int i = 0; i < nl.getLength(); i++) {
+		Node node = nl.item(i);
+		if (node instanceof Element) {
+			Element ele = (Element) node;
+				parseDefaultElement(ele, delegate);
+		}
+	}
+				
+	//三部分，import, alias, bean我们主要看bean那部分
+	private void parseDefaultElement(Element ele, BeanDefinitionParserDelegate delegate) {
+		if (DomUtils.nodeNameEquals(ele, IMPORT_ELEMENT)) {
+			importBeanDefinitionResource(ele);
+		}
+		else if (DomUtils.nodeNameEquals(ele, ALIAS_ELEMENT)) {
+			processAliasRegistration(ele);
+		}
+		else if (DomUtils.nodeNameEquals(ele, BEAN_ELEMENT)) {
+			processBeanDefinition(ele, delegate);
+		}
+	}
+	
+	protected void processBeanDefinition(Element ele, BeanDefinitionParserDelegate delegate) {
+		//读取bean配置
+		BeanDefinitionHolder bdHolder = delegate.parseBeanDefinitionElement(ele);
+		//注册到Map
+		BeanDefinitionReaderUtils.registerBeanDefinition(bdHolder, getReaderContext().getRegistry());
+	}
+[/code]
+接着去到了BeanDefinitionParserDelegate，这个类承担了大部分的“脏活”：	
+[code="java"]
+	//从下面代码中可见，如果定义了id，则beanName=id，否则取name列表中的第一个为beanName。除了beanName外，其他称为alias
+	public BeanDefinitionHolder parseBeanDefinitionElement(Element ele, BeanDefinition containingBean) {
+		String id = ele.getAttribute(ID_ATTRIBUTE);
+		String nameAttr = ele.getAttribute(NAME_ATTRIBUTE);
+
+		List<String> aliases = new ArrayList<String>();
+		if (StringUtils.hasLength(nameAttr)) {
+			String[] nameArr = StringUtils.tokenizeToStringArray(nameAttr, BEAN_NAME_DELIMITERS);
+			aliases.addAll(Arrays.asList(nameArr));
+		}
+
+		String beanName = id;
+		if (!StringUtils.hasText(beanName) && !aliases.isEmpty()) {
+			beanName = aliases.remove(0);
+		}
+
+		AbstractBeanDefinition beanDefinition = parseBeanDefinitionElement(ele, beanName, containingBean);
+		return new BeanDefinitionHolder(beanDefinition, beanName, aliasesArray);
+	}
+
+	public AbstractBeanDefinition parseBeanDefinitionElement(
+			Element ele, String beanName, BeanDefinition containingBean) {
+
+		String className = null;
+		if (ele.hasAttribute(CLASS_ATTRIBUTE)) {
+			className = ele.getAttribute(CLASS_ATTRIBUTE).trim();
+		}
+		AbstractBeanDefinition bd = createBeanDefinition(className, parent);
+
+		parseBeanDefinitionAttributes(ele, beanName, containingBean, bd);
+		parseMetaElements(ele, bd);
+		parseLookupOverrideSubElements(ele, bd.getMethodOverrides());
+		parseReplacedMethodSubElements(ele, bd.getMethodOverrides());
+		parseConstructorArgElements(ele, bd);
+		
+		//主要看一下这个方法
+		parsePropertyElements(ele, bd);
+		parseQualifierElements(ele, bd);
+
+		return bd;
+	}
+	
+	//可能有多个Property
+	public void parsePropertyElements(Element beanEle, BeanDefinition bd) {
+		NodeList nl = beanEle.getChildNodes();
+		for (int i = 0; i < nl.getLength(); i++) {
+			Node node = nl.item(i);
+			parsePropertyElement((Element) node, bd);
+		}
+	}
+	
+	public void parsePropertyElement(Element ele, BeanDefinition bd) {
+			Object val = parsePropertyValue(ele, bd, propertyName);
+			PropertyValue pv = new PropertyValue(propertyName, val);
+			parseMetaElements(ele, pv);
+			pv.setSource(extractSource(ele));
+			bd.getPropertyValues().addPropertyValue(pv);
+	}
+	
+	public Object parsePropertyValue(Element ele, BeanDefinition bd, String propertyName) {
+
+		/*Property有多种形式，例如
+		<property name="message" value="Hello World!"/>  
+        <property name="age">  
+            <value>1</value>  
+        </property>  
+		也可以是List, Map等等
+		*/
+		// Should only have one child element: ref, value, list, etc.
+		NodeList nl = ele.getChildNodes();
+		Element subElement = null;
+		for (int i = 0; i < nl.getLength(); i++) {
+				Node node = nl.item(i);
+				subElement = (Element) node;
+			}
+		}
+
+		boolean hasRefAttribute = ele.hasAttribute(REF_ATTRIBUTE);
+		boolean hasValueAttribute = ele.hasAttribute(VALUE_ATTRIBUTE);
+
+		//ref="..."
+		if (hasRefAttribute) {
+			String refName = ele.getAttribute(REF_ATTRIBUTE);
+			RuntimeBeanReference ref = new RuntimeBeanReference(refName);
+			ref.setSource(extractSource(ele));
+			return ref;
+		}
+		//value="..."
+		else if (hasValueAttribute) {
+			TypedStringValue valueHolder = new TypedStringValue(ele.getAttribute(VALUE_ATTRIBUTE));
+			valueHolder.setSource(extractSource(ele));
+			return valueHolder;
+		}
+		//非直接量，例如List
+		else if (subElement != null) {
+			return parsePropertySubElement(subElement, bd);
+		}
+	}
+	
+	//这个方法涵盖了List, Map, Array等等
+	public Object parsePropertySubElement(Element ele, BeanDefinition bd, String defaultValueType) {
+	    if (nodeNameEquals(ele, REF_ELEMENT)) {
+			// A generic reference to any name of any bean.
+			String refName = ele.getAttribute(BEAN_REF_ATTRIBUTE);
+			boolean toParent = false;
+			if (!StringUtils.hasLength(refName)) {
+				// A reference to the id of another bean in the same XML file.
+				refName = ele.getAttribute(LOCAL_REF_ATTRIBUTE);
+				if (!StringUtils.hasLength(refName)) {
+					// A reference to the id of another bean in a parent context.
+					refName = ele.getAttribute(PARENT_REF_ATTRIBUTE);
+					toParent = true;
+					if (!StringUtils.hasLength(refName)) {
+						error("'bean', 'local' or 'parent' is required for <ref> element", ele);
+						return null;
+					}
+				}
+			}
+			if (!StringUtils.hasText(refName)) {
+				error("<ref> element contains empty target attribute", ele);
+				return null;
+			}
+			RuntimeBeanReference ref = new RuntimeBeanReference(refName, toParent);
+			ref.setSource(extractSource(ele));
+			return ref;
+		}
+		else if (nodeNameEquals(ele, IDREF_ELEMENT)) {
+			return parseIdRefElement(ele);
+		}
+		else if (nodeNameEquals(ele, VALUE_ELEMENT)) {
+			return parseValueElement(ele, defaultValueType);
+		}
+		else if (nodeNameEquals(ele, NULL_ELEMENT)) {
+			// It's a distinguished null value. Let's wrap it in a TypedStringValue
+			// object in order to preserve the source location.
+			TypedStringValue nullHolder = new TypedStringValue(null);
+			nullHolder.setSource(extractSource(ele));
+			return nullHolder;
+		}
+		else if (nodeNameEquals(ele, ARRAY_ELEMENT)) {
+			return parseArrayElement(ele, bd);
+		}
+		else if (nodeNameEquals(ele, LIST_ELEMENT)) {
+			return parseListElement(ele, bd);
+		}
+		else if (nodeNameEquals(ele, SET_ELEMENT)) {
+			return parseSetElement(ele, bd);
+		}
+		else if (nodeNameEquals(ele, MAP_ELEMENT)) {
+			return parseMapElement(ele, bd);
+		}
+		else if (nodeNameEquals(ele, PROPS_ELEMENT)) {
+			return parsePropsElement(ele);
+		}
+		else {
+			error("Unknown property sub-element: [" + ele.getNodeName() + "]", ele);
+			return null;
+		}
+	}
+	
+[/code]
+	
+Spring IoC容器启动过程是相当复杂，因为它支持各种灵活的配置——这可能是一个框架所必须的吧
+但就我个人而言，在可能的情况下，我会限定只采用一两种配置（例如XML），从而简化逻辑，所谓“约定大于配置”
+
+参考文章：[url]http://www.ibm.com/developerworks/cn/java/j-lo-beanxml/[/url]
+
